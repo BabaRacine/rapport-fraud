@@ -1,0 +1,251 @@
+---
+title: "Rapport du TER sur la Détection de fraude bancaire"
+subtitle: "Projet réalisé sous la direction de M. Laurent Rouvière"
+author: 
+  - name: "Ly Amadou"
+  - name: "Baba Compaoré"
+  - name: "Nguyen Huy Hoang"
+  - name: "Bryan Foulla"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    number-sections: true
+knitr:  
+  opts_chunk:  
+    echo: false        # Cache le code R  
+    warning: false     # Cache les warnings  
+    message: false     # Cache les messages  
+    error: false       # Cache les erreurs 
+editor: visual
+---
+
+***Projet réalisé sous la direction de M. Laurent Rouvière***
+
+# Introduction
+
+## Contexte et motivation
+
+La fraude bancaire représente un enjeu majeur pour les institutions financières. Elle se manifeste à travers diverses formes, notamment les fraudes par carte bancaire (vol, transactions suspectes) et celles non liées à la carte (usurpation d'identité, blanchiment d'argent). Avec la croissance exponentielle des transactions numériques, détecter efficacement ces fraudes est devenu crucial.
+
+Le principal défi réside dans le déséquilibre des données : les fraudes sont rares, ce qui rend difficile la détection via des méthodes classiques. D'où l’intérêt du Machine Learning (ML), qui permet d’identifier des motifs subtils dans des volumes massifs de données.
+
+## Objectifs du projet
+
+Ce projet a pour but de :
+
+-   Construire des modèles de classification pour détecter les fraudes.
+-   Comparer plusieurs algorithmes de ML (LightGBM, XGBoost, CatBoost).
+-   Interpréter les résultats à l’aide des valeurs SHAP.
+-   Déployer une application web interactive via Shiny.
+
+# Analyse exploratoire des données (EDA)
+
+## Présentation générale
+
+Le dataset utilisé contient les transactions de carte bancaire effectuées en deux jours. Il comporte **284 807 transactions**, dont **492 sont frauduleuses** (\~0.172%). Les données sont entièrement numériques, la plupart issues d'une analyse en composantes principales (PCA).
+
+Les variables notables : - `Time` : secondes depuis la première transaction. - `Amount` : montant de la transaction. - `Class` : 1 si fraude, 0 sinon.
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+library(tidyverse)
+
+df <- read_csv("creditcard.csv")
+library(psych)
+library(DT)
+
+# Tableau interactif (arrondi)
+datatable(round(describe(df), 2), 
+          options = list(scrollX = TRUE), 
+          caption = "Résumé statistique des variables")
+dim(df)
+table(df$Class)
+```
+
+## Déséquilibre des classes
+
+On observe un fort déséquilibre entre les classes. Les fraudes représentent moins de 0.2% des observations.
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+ggplot(df, aes(factor(Class))) +
+  geom_bar(fill = c("steelblue", "red")) +
+  labs(title = "Répartition des classes", x = "Classe", y = "Nombre de transactions") +
+  scale_x_discrete(labels = c("Non frauduleuse", "Fraude")) +
+  theme_minimal()
+```
+
+**Interprétation :** Ce déséquilibre justifie l'utilisation de techniques de rééchantillonnage et de métriques adaptées (F1-score, AUC-PR).
+
+## Analyse univariée
+
+### Montant des transactions (`Amount`)
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+ggplot(df, aes(x = Amount)) +
+  geom_histogram(bins = 50, fill = "steelblue") +
+  labs(title = "Distribution du montant des transactions", x = "Montant", y = "Fréquence") +
+  theme_minimal()
+```
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+ggplot(df, aes(x = Amount, fill = factor(Class))) +
+  geom_histogram(bins = 50, position = "identity", alpha = 0.5) +
+  labs(title = "Montant par type de transaction", x = "Montant", fill = "Classe") +
+  theme_minimal()
+```
+
+**Interprétation :** Les fraudes se produisent souvent sur de faibles montants, mais il existe aussi quelques fraudes sur des montants élevés. Cela peut indiquer une stratégie d’évasion (petits montants invisibles) ou des tentatives opportunistes.
+
+### Temps (`Time`)
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+ggplot(df, aes(x = Time, fill = factor(Class))) +
+  geom_histogram(bins = 100, position = "identity", alpha = 0.5) +
+  labs(title = "Transactions dans le temps", x = "Temps (secondes)", fill = "Classe") +
+  theme_minimal()
+```
+
+**Interprétation :** Les fraudes ont tendance à se concentrer à certains moments. Cela pourrait correspondre à des périodes de moindre surveillance (heures creuses ?).
+
+## Analyse bivariée
+
+### Variables les plus discriminantes
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+library(reshape2)
+df_selected <- df %>% select(V10, V12, V14, Class)
+
+df_melt <- melt(df_selected, id.vars = "Class")
+
+ggplot(df_melt, aes(x = factor(Class), y = value, fill = factor(Class))) +
+  geom_boxplot() +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Boxplots des variables discriminantes", x = "Classe", y = "Valeur") +
+  theme_minimal()
+```
+
+**Interprétation :** Les variables `V10`, `V12`, `V14` montrent une différence nette entre les deux classes. Elles seront probablement importantes pour les modèles prédictifs.
+
+## Corrélations
+
+Pour éviter un traitement lourd, on prend un échantillon aléatoire.
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+set.seed(123)
+sample_df <- df[sample(1:nrow(df), 10000), ]
+cor_matrix <- cor(sample_df %>% select(starts_with("V")))
+
+library(corrplot)
+corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.6)
+```
+
+**Interprétation :** Certaines variables issues de la PCA sont encore corrélées entre elles. Cela peut influencer certains modèles sensibles aux colinéarités.
+
+# Modélisation Machine Learning
+
+## Prétraitement des données
+
+Le dataset est fortement déséquilibré : seulement 0,172 % des transactions sont frauduleuses. Cela pose problème pour les modèles de Machine Learning classiques, qui pourraient prédire "non fraude" tout le temps et avoir raison dans 99,8 % des cas… sans jamais détecter la moindre fraude.
+
+Pour contrer cela, on applique des méthodes de **rééquilibrage des données** :
+
+-   **Oversampling** : on "duplique" ou génère plus d'exemples de fraudes (classe minoritaire).
+-   **Undersampling** : on réduit le nombre d’exemples de transactions normales.
+-   **Méthodes combinées** : on fait un peu des deux.
+
+Ces techniques permettent aux modèles d'apprendre les schémas de fraude, même rares.
+
+## Entraînement des modèles
+
+Nous avons entraîné plusieurs modèles d’apprentissage automatique : - **XGBoost** : basé sur les arbres de décision, efficace pour les données structurées. - **LightGBM** : similaire à XGBoost mais plus rapide sur les gros jeux de données. - **CatBoost** : bien adapté aux données catégorielles.
+
+### Évaluation : quelles métriques utiliser ?
+
+Pour évaluer ces modèles, on utilise les **métriques suivantes** :
+
+-   **Précision (Precision)** : parmi toutes les transactions identifiées comme fraude, combien le sont vraiment ?
+-   **Rappel (Recall)** : parmi toutes les fraudes réelles, combien ont été détectées ?
+-   **F1-score** : moyenne entre précision et rappel. Plus il est élevé, mieux le modèle équilibre ces deux critères.
+-   **AUC-PR (Aire sous la courbe Précision-Rappel)** : utile quand les classes sont déséquilibrées.
+-   **MCC (Matthews Correlation Coefficient)** : donne une vue d’ensemble robuste, même en cas de déséquilibre.
+
+`{# Exemple illustratif :} # library(caret) # confusionMatrix(predictions, truth)`
+
+## Résultats comparatifs
+
+Les tests montrent que :
+
+-   L’**oversampling** améliore clairement la capacité du modèle à détecter les fraudes.
+-   Le **modèle XGBoost** (avec réglage de seuil) donne le meilleur F1-score.
+-   LightGBM reste une bonne alternative, plus rapide mais un peu moins stable.
+
+```{r, echo=TRUE, eval=TRUE, results='show'}
+# Visualisation disponible dans l'application via radar chart
+```
+
+------------------------------------------------------------------------
+
+# Interprétation des modèles
+
+## À quoi servent les valeurs SHAP ?
+
+Les **valeurs SHAP (SHapley Additive exPlanations)** permettent de comprendre comment un modèle prend ses décisions. C’est très utile car les modèles comme XGBoost ou LightGBM sont souvent vus comme des "boîtes noires".
+
+### SHAP : pour expliquer une prédiction
+
+-   **Globale** : quelles variables sont les plus importantes dans l’ensemble des prédictions ?
+-   **Locale** : pour une transaction donnée, quelles variables ont pesé dans la balance ?
+
+`{# shapviz ou SHAPforxgboost} # shap.plot.summary(shap_values)`
+
+## Exemples concrets d’interprétation
+
+-   La variable **V14** est très discriminante : des valeurs faibles de V14 sont souvent liées à des fraudes.
+-   La variable **V10** a un rôle clé dans la détection.
+-   Grâce à SHAP, on peut visualiser pourquoi une transaction a été classée comme frauduleuse → utile pour les analystes et les banques.
+
+`{# shap.plot.force(...)}`
+
+------------------------------------------------------------------------
+
+# Application Shiny
+
+## Objectif de l'application
+
+Permettre aux utilisateurs (data analysts, professeurs, étudiants) d’explorer les données, les modèles et leurs résultats de manière interactive.
+
+## Fonctionnalités principales
+
+-   Onglet **Exploration** : visualiser les données, analyser les montants et fréquences
+-   Onglet **Modélisation** : comparer les scores des modèles (graphiques radar)
+-   Onglet **SHAP** : comprendre l’importance des variables
+-   Onglet **Présentation** : explication du contexte et du projet
+
+------------------------------------------------------------------------
+
+# Conclusion et perspectives
+
+## Résumé
+
+-   Nous avons traité un problème de classification avec données très déséquilibrées.
+-   Une analyse exploratoire rigoureuse nous a permis d’identifier les variables clés.
+-   Le modèle XGBoost équilibré a obtenu de très bons résultats.
+-   L’interprétation via SHAP a rendu le modèle plus transparent.
+
+## Limites
+
+-   Les variables étant anonymisées (via ACP), il est difficile de leur donner un sens métier.
+-   Les modèles sont statiques : ils ne s’adaptent pas automatiquement à de nouvelles fraudes.
+
+# Références
+
+-   Handbook of Fraud Detection <https://fraud-detection-handbook.github.io/fraud-detection-handbook>
+
+-   Interpretable Machine Learning (Christoph Molnar) – Chapitre SHAP <https://christophm.github.io/interpretable-ml-book/shap.html>
+
+-   Documentation SHAP : <https://github.com/slundberg/shap>
+
+quarto render ton_fichier.qmd --to pdf\
+\
